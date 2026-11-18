@@ -6,20 +6,19 @@ package io.github.cloudcutter.work.lightleak
 
 import android.app.Service
 import android.content.Intent
+import android.net.Network
 import android.os.Binder
 import android.util.Log
 import io.github.cloudcutter.ext.crc32
 import io.github.cloudcutter.ext.getBroadcastAddress
-import io.github.cloudcutter.ext.send
+import io.github.cloudcutter.ext.bindDatagramSocket
+import io.github.cloudcutter.ext.sendOnNetwork
 import io.github.cloudcutter.util.RequestBus
 import io.github.cloudcutter.work.exceptions.PacketReadException
 import io.github.cloudcutter.work.exceptions.ServiceDisconnectedException
 import io.github.cloudcutter.work.lightleak.command.CommandRequest
 import io.github.cloudcutter.work.lightleak.command.FlashReadCommand
 import io.github.cloudcutter.work.protocol.proper.FlashReadPacket
-import io.ktor.network.selector.*
-import io.ktor.network.sockets.*
-import io.ktor.utils.io.core.*
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -29,6 +28,9 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.net.DatagramPacket
+import java.net.DatagramSocket
+import java.net.InetSocketAddress
 import java.io.File
 import java.io.RandomAccessFile
 import java.nio.ByteBuffer
@@ -38,6 +40,7 @@ import kotlin.math.ceil
 class LightleakService : Service(), CoroutineScope {
 	companion object {
 		private const val TAG = "LightleakService"
+		private const val DIAG = "CLOUDCUTTER_UDP_DIAG_V1"
 	}
 
 	override val coroutineContext = Job() + Dispatchers.IO
@@ -45,6 +48,8 @@ class LightleakService : Service(), CoroutineScope {
 	private val packets = Channel<Pair<Int, ByteArray>>(Channel.UNLIMITED)
 
 	private var data: LightleakData? = null
+	private var udpListener: Job? = null
+	@Volatile private var udpSocket: DatagramSocket? = null
 	private val log
 		get() = data?.serviceLog
 
@@ -59,47 +64,72 @@ class LightleakService : Service(), CoroutineScope {
 			this@LightleakService.data = data
 		}
 
+		fun setNetwork(network: Network?) {
+			data?.wifiNetwork = network
+			startUdpListener(network)
+		}
+
 		suspend fun <T : CommandRequest, D> request(command: T) = bus.request<D>(command)
 	}
 
 	override fun onCreate() {
 		Log.d(TAG, "Creating $TAG")
 		bus.subscribe(this, this::onCommand)
-		startUdpListener()
 	}
 
 	override fun onBind(intent: Intent) = ServiceBinder()
 
 	override fun onUnbind(intent: Intent): Boolean {
+		udpSocket?.close()
+		udpListener?.cancel()
 		this@LightleakService.data = null
 		return false
 	}
 
 	override fun onDestroy() {
 		Log.d(TAG, "Destroying $TAG")
+		udpSocket?.close()
 		this.cancel()
 	}
 
-	private fun startUdpListener() = launch {
-		val selectorManager = SelectorManager(Dispatchers.IO)
-		val address = InetSocketAddress("0.0.0.0", 6667)
-		val socket = aSocket(selectorManager).udp().bind(address) {
-			reuseAddress = true
-			broadcast = true
+	private fun startUdpListener(network: Network?) {
+		udpSocket?.close()
+		udpListener?.cancel()
+		if (network == null) {
+			Log.i(TAG, "$DIAG Wi-Fi network unavailable; UDP listener stopped")
+			return
 		}
-		Log.d(TAG, "UDP listener started")
-
-		while (isActive) {
-			val packet = socket.receive().packet
-			val requestId = packet.readIntLittleEndian()
-			val crc32 = packet.readIntLittleEndian()
-			val data = packet.readBytes()
-			// val dataString = data.take(64).toHexString()
-			// Log.d(TAG, "Got packet: requestId=$requestId, crc32=$crc32, data=$dataString")
-			if (crc32 == data.crc32()) {
-				packets.send(requestId to data)
-			} else {
-				log?.invoke("Packet CRC invalid. Got $crc32, expected ${data.crc32()}")
+		udpListener = launch {
+			val socket = DatagramSocket(null)
+			try {
+				network.bindDatagramSocket(socket)
+				socket.reuseAddress = true
+				socket.bind(InetSocketAddress("0.0.0.0", 6667))
+				udpSocket = socket
+				Log.i(TAG, "$DIAG listener bound to UDP 0.0.0.0:6667 on $network")
+				while (isActive) {
+					val buffer = ByteArray(65535)
+					val datagram = DatagramPacket(buffer, buffer.size)
+					socket.receive(datagram)
+					if (datagram.length < 8) continue
+					val packetBytes = datagram.data.copyOfRange(datagram.offset, datagram.offset + datagram.length)
+					val header = ByteBuffer.wrap(packetBytes).order(ByteOrder.LITTLE_ENDIAN)
+					val requestId = header.int
+					val receivedCrc = header.int
+					val payload = packetBytes.copyOfRange(8, packetBytes.size)
+					val actualCrc = payload.crc32()
+					log?.invoke("$DIAG UDP RX id=$requestId bytes=${payload.size} crcOK=${receivedCrc == actualCrc} from=${datagram.address.hostAddress}:${datagram.port}")
+					if (receivedCrc == actualCrc) packets.send(requestId to payload)
+					else log?.invoke("$DIAG CRC mismatch: received=$receivedCrc actual=$actualCrc")
+				}
+			} catch (e: Exception) {
+				if (isActive) {
+					Log.e(TAG, "$DIAG UDP listener exception", e)
+					log?.invoke("$DIAG UDP listener exception: ${e.javaClass.simpleName}: ${e.message}")
+				}
+			} finally {
+				if (udpSocket === socket) udpSocket = null
+				socket.close()
 			}
 		}
 	}
@@ -153,10 +183,18 @@ class LightleakService : Service(), CoroutineScope {
 				length = readPacketCount * readPacketSize,
 				maxLength = readPacketSize,
 			).also { it.returnIp = data?.localAddress ?: getBroadcastAddress() }
+			if (failedCount < 3 || failedCount % 25 == 0) {
+				log?.invoke("$DIAG UDP TX id=$requestId offset=0x${readOffset.toString(16)} " +
+					"bytes=${readPacketCount * readPacketSize} " +
+					"destination=${(data?.gatewayAddress ?: getBroadcastAddress()).hostAddress}:6669 " +
+					"returnIp=${(data?.localAddress ?: getBroadcastAddress()).hostAddress}")
+			}
 			try {
-				packet.send(data?.gatewayAddress ?: getBroadcastAddress())
+				val network = data?.wifiNetwork ?: throw IllegalStateException("Connected Wi-Fi network is unavailable")
+				packet.sendOnNetwork(data?.gatewayAddress ?: getBroadcastAddress(), network)
 			} catch (e: Throwable) {
-				// wait a bit longer in case of [network] exceptions
+				log?.invoke("$DIAG UDP TX error: ${e.javaClass.simpleName}: ${e.message}")
+				Log.e(TAG, "$DIAG UDP TX error", e)
 				delay(500)
 			}
 
@@ -171,14 +209,21 @@ class LightleakService : Service(), CoroutineScope {
 			val endTime = System.currentTimeMillis() + readTimeoutMs
 			while (packetsReceived < readPacketsMax && System.currentTimeMillis() < endTime) {
 				val result = packets.tryReceive()
-				if (!result.isSuccess)
+				if (!result.isSuccess) {
+					delay(5)  // Let listener coroutine run; avoid tight polling
 					continue
+				}
 				val bytes = result.getOrThrow().second
 				val buf = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
 				val offset = buf.int
 				val length = buf.int
 				val index = packetOffsets.indexOf(offset)
-				log?.invoke("Received data #$index, offset=0x${offset.toString(16)}, size=${bytes.size}")
+				log?.invoke("$DIAG decoded reply index=$index offset=0x${offset.toString(16)} " +
+					"declaredLength=$length bytes=${bytes.size}")
+				if (index < 0 || length < 0 || length > bytes.size - 8) {
+					log?.invoke("$DIAG ignored unexpected/malformed reply")
+					continue
+				}
 				packetList[index] = bytes.sliceArray(8 until length + 8)
 				packetsReceived++
 			}

@@ -5,6 +5,7 @@
 package io.github.cloudcutter.ext
 
 import android.content.Context
+import android.net.Network
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.os.Build
@@ -16,6 +17,9 @@ import io.ktor.utils.io.*
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.net.Inet4Address
+import java.net.DatagramPacket
+import java.net.DatagramSocket
+import java.net.InetSocketAddress
 
 fun Context.hasInternet(): Boolean {
 	val cm = getSystemService<ConnectivityManager>()
@@ -44,7 +48,7 @@ fun getLocalhostAddress() = "127.0.0.1".toInet4Address()
 suspend fun IPacket.send(address: Inet4Address) {
 	val selectorManager = SelectorManager(Dispatchers.IO)
 	val socket = aSocket(selectorManager).udp().connect(
-		remoteAddress = InetSocketAddress(address.toInet4String(), 6669),
+		remoteAddress = io.ktor.network.sockets.InetSocketAddress(address.toInet4String(), 6669),
 		localAddress = null,
 		configure = {
 			broadcast = true
@@ -57,5 +61,26 @@ suspend fun IPacket.send(address: Inet4Address) {
 		// Log.d("IPacket", "Wrote packet: ${packet.toHexString()}")
 		socket.close()
 		selectorManager.close()
+	}
+}
+
+fun Network.bindDatagramSocket(socket: DatagramSocket) {
+	if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+		bindSocket(socket)
+	} else {
+		@Suppress("DEPRECATION")
+		ConnectivityManager.setProcessDefaultNetwork(this)
+	}
+}
+
+suspend fun IPacket.sendOnNetwork(address: Inet4Address, network: Network) = withContext(Dispatchers.IO) {
+	val socket = DatagramSocket(null)
+	try {
+		network.bindDatagramSocket(socket)
+		socket.bind(InetSocketAddress(0))
+		val bytes = serialize()
+		socket.send(DatagramPacket(bytes, bytes.size, address, 6669))
+	} finally {
+		socket.close()
 	}
 }

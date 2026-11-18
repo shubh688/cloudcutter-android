@@ -11,6 +11,7 @@ import android.content.ServiceConnection
 import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
+import android.net.Network
 import android.view.View
 import androidx.fragment.app.viewModels
 import androidx.navigation.fragment.navArgs
@@ -132,6 +133,12 @@ class LightleakFragment : BaseFragment<LightleakFragmentBinding>({ inflater, par
 		data.gatewayAddress = gateway
 	}
 
+	override fun onNetworkChanged(network: Network?) {
+		data.wifiNetwork = network
+		vm.binder?.setNetwork(network)
+		log("Lightleak Wi-Fi network ${if (network == null) "lost" else "available: $network"}")
+	}
+
 	override fun onAddressesTextChanged(local: String?, gateway: String?) {
 		b.wifiState.localAddress = local
 		b.wifiState.gatewayAddress = gateway
@@ -164,6 +171,7 @@ class LightleakFragment : BaseFragment<LightleakFragmentBinding>({ inflater, par
 	override fun onServiceConnected(className: ComponentName, service: IBinder) {
 		log("Service connected: $className")
 		vm.binder = service as? LightleakService.ServiceBinder
+		vm.binder?.setNetwork(data.wifiNetwork)
 	}
 
 	override fun onServiceDisconnected(className: ComponentName?) {

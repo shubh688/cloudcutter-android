@@ -24,6 +24,7 @@ interface NetworkAwareFragment {
 	fun onAddressesChanged(local: Inet4Address?, gateway: Inet4Address?) {}
 	fun onAddressesTextChanged(local: String?, gateway: String?) {}
 	fun onConnectedSsidChanged(ssid: String?, rssi: Int?) {}
+	fun onNetworkChanged(network: Network?) {}
 
 	val connectivityManager
 		get() = getContext()?.getSystemService<ConnectivityManager>()
@@ -43,6 +44,14 @@ interface NetworkAwareFragment {
 					linkProperties: LinkProperties,
 				) {
 					this@NetworkAwareFragment.onLinkPropertiesChanged(linkProperties)
+				}
+
+				override fun onAvailable(network: Network) {
+					this@NetworkAwareFragment.onNetworkChanged(network)
+				}
+
+				override fun onLost(network: Network) {
+					this@NetworkAwareFragment.onNetworkChanged(null)
 				}
 
 				override fun onCapabilitiesChanged(

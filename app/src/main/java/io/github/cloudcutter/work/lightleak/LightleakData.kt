@@ -9,6 +9,7 @@ import io.github.cloudcutter.data.model.ProfileLightleak
 import io.github.cloudcutter.util.FileLogger
 import java.io.File
 import java.net.Inet4Address
+import android.net.Network
 
 class LightleakData {
 
@@ -22,6 +23,7 @@ class LightleakData {
 	var serviceLog = FileLogger(name = "Lightleak")
 	var localAddress: Inet4Address? = null
 	var gatewayAddress: Inet4Address? = null
+	var wifiNetwork: Network? = null
 
 	val profileData
 		get() = profile.value?.data
